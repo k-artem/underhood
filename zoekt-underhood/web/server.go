@@ -8,6 +8,7 @@ import (
 	//"html"
 	"log"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -32,6 +33,9 @@ type Server struct {
 	// Version string for this server.
 	Version string
 
+	// IndexDir is the path to the index directory
+	IndexDir string
+
 	startTime time.Time
 }
 
@@ -43,6 +47,7 @@ func NewMux(s *Server) (*http.ServeMux, error) {
 	mux.HandleFunc("/api/source", s.serveSource)
 	mux.HandleFunc("/api/decor", s.serveDecors)
 	mux.HandleFunc("POST /api/search-xref", s.serveSearchXref)
+	mux.HandleFunc("/api/index-status", s.serveIndexStatus)
 
 	return mux, nil
 }
@@ -823,4 +828,119 @@ func escapeLiteralQuery(s string) string {
 		r.WriteRune(c)
 	}
 	return r.String()
+}
+
+// IndexStatus represents the status of the Zoekt index
+type IndexStatus struct {
+	Repositories  []RepositoryStatus `json:"repositories"`
+	TotalSizeMB   float64            `json:"totalSizeMB"`
+	TotalFiles    int                `json:"totalFiles"`
+	LastUpdate    time.Time          `json:"lastUpdate"`
+	LastUpdateStr string             `json:"lastUpdateStr"`
+}
+
+// RepositoryStatus represents status for a single repository
+type RepositoryStatus struct {
+	Name       string    `json:"name"`
+	Branches   []string  `json:"branches"`
+	LastUpdate time.Time `json:"lastUpdate"`
+}
+
+func (s *Server) serveIndexStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Query all repositories
+	q, err := query.Parse("r:.*")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	opts := zoekt.ListOptions{}
+	result, err := s.Searcher.List(ctx, q, &opts)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build status response
+	status := IndexStatus{
+		Repositories: make([]RepositoryStatus, 0),
+	}
+
+	var latestUpdate time.Time
+	repoMap := make(map[string]*RepositoryStatus)
+
+	for _, repo := range result.Repos {
+		repoName := repo.Repository.Name
+
+		// Get or create repo status
+		repoStatus, exists := repoMap[repoName]
+		if !exists {
+			repoStatus = &RepositoryStatus{
+				Name:     repoName,
+				Branches: make([]string, 0),
+			}
+			repoMap[repoName] = repoStatus
+		}
+
+		// Add branches
+		for _, branch := range repo.Repository.Branches {
+			if !slices.Contains(repoStatus.Branches, branch.Name) {
+				repoStatus.Branches = append(repoStatus.Branches, branch.Name)
+			}
+
+			// Track latest update time
+			if branch.Version != "" {
+				// Branch version contains timestamp information
+				// Use IndexMetadata if available
+				if !repo.IndexMetadata.IndexTime.IsZero() {
+					if repo.IndexMetadata.IndexTime.After(latestUpdate) {
+						latestUpdate = repo.IndexMetadata.IndexTime
+					}
+					if repo.IndexMetadata.IndexTime.After(repoStatus.LastUpdate) {
+						repoStatus.LastUpdate = repo.IndexMetadata.IndexTime
+					}
+				}
+			}
+		}
+	}
+
+	// Convert map to slice
+	for _, repoStatus := range repoMap {
+		status.Repositories = append(status.Repositories, *repoStatus)
+	}
+
+	// Sort repositories by name
+	sort.Slice(status.Repositories, func(i, j int) bool {
+		return status.Repositories[i].Name < status.Repositories[j].Name
+	})
+
+	status.LastUpdate = latestUpdate
+	status.LastUpdateStr = latestUpdate.Format("2006-01-02 15:04:05")
+	status.TotalFiles = len(result.Repos)
+
+	// Calculate total size from actual shard files on disk
+	indexDir := s.IndexDir
+	if indexDir == "" {
+		indexDir = os.ExpandEnv("$HOME/.zoekt/index")
+	}
+
+	var totalBytes int64
+	files, err := os.ReadDir(indexDir)
+	if err == nil {
+		for _, file := range files {
+			if !file.IsDir() && strings.HasSuffix(file.Name(), ".zoekt") {
+				info, err := file.Info()
+				if err == nil {
+					totalBytes += info.Size()
+				}
+			}
+		}
+	}
+
+	status.TotalSizeMB = float64(totalBytes) / (1024 * 1024)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
 }
