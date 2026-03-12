@@ -86,6 +86,7 @@ func main() {
 
 	s := &web.Server{
 		Searcher: searcher,
+		IndexDir: *index,
 	}
 
 	handler, err := web.NewMux(s)
